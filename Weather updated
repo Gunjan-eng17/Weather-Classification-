@@ -1,0 +1,566 @@
+# ============================================================================
+# IMPORTS
+# ============================================================================
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.calibration import calibration_curve
+from scipy.stats import ttest_rel, wilcoxon
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
+from tensorflow.keras.applications import Xception
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+from tensorflow.keras.utils import to_categorical
+import cv2
+
+def apply_clahe(img):
+    img_uint8 = (img * 255).astype(np.uint8)
+    img_yuv = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2YUV)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    img_yuv[:,:,0] = clahe.apply(img_yuv[:,:,0])
+    img_output = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2RGB)
+    return img_output / 255.0
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+BASE_PATH = '/kaggle/input/multiclass-weather-dataset/Multi-class Weather Dataset'
+IMG_SIZE = (224, 224)
+NUM_CLASSES = 4
+BATCH_SIZE = 32
+EPOCHS = 30
+LEARNING_RATE = 0.0001
+CLASS_NAMES = ['Cloudy', 'Rain', 'Shine', 'Sunrise']
+
+# ============================================================================
+# DATA LOADER
+# ============================================================================
+
+def load_dataset(base_path):
+
+    images, labels = [], []
+
+    for idx, class_name in enumerate(CLASS_NAMES):
+
+        class_path = os.path.join(base_path, class_name)
+
+        files = [f for f in os.listdir(class_path)
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+        for file in files:
+
+            img = load_img(os.path.join(class_path, file),
+                           target_size=IMG_SIZE)
+
+            img = img_to_array(img)
+
+            # Normalize first
+            img = img.astype('float32') / 255.0
+
+            # Apply CLAHE (as claimed in manuscript)
+            img = apply_clahe(img)
+
+            images.append(img)
+            labels.append(idx)
+
+    X = np.array(images, dtype='float32')
+    y = np.array(labels)
+
+    return X, y
+# ============================================================================
+# DATA AUGMENTATION
+# ============================================================================
+
+train_datagen = ImageDataGenerator(
+    horizontal_flip=True,
+    vertical_flip=True,
+     rotation_range=20,
+    zoom_range=[0.9, 1.1],
+    brightness_range=[0.85, 1.15]
+)
+
+val_datagen = ImageDataGenerator()
+
+# ============================================================================
+# MOdel ARCHITECTURE
+# ============================================================================
+
+class SENetBlock(layers.Layer):
+
+    def __init__(self, reduction_ratio=16, **kwargs):
+        super(SENetBlock, self).__init__(**kwargs)
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        channels = input_shape[-1]
+        self.global_avg_pool = layers.GlobalAveragePooling2D()
+        self.fc1 = layers.Dense(channels // self.reduction_ratio,
+                                activation='relu',
+                                use_bias=False)
+        self.fc2 = layers.Dense(channels,
+                                activation='sigmoid',
+                                use_bias=False)
+        super().build(input_shape)
+
+    def call(self, inputs):
+        squeeze = self.global_avg_pool(inputs)
+        excitation = self.fc1(squeeze)
+        excitation = self.fc2(excitation)
+        excitation = tf.reshape(
+            excitation, [-1, 1, 1, tf.shape(inputs)[-1]]
+        )
+        return inputs * excitation
+
+
+class AttentionBlock(layers.Layer):
+
+    def build(self, input_shape):
+        channels = input_shape[-1]
+        self.query_conv = layers.Conv2D(channels, 1, padding='same')
+        self.key_conv = layers.Conv2D(channels, 1, padding='same')
+        self.value_conv = layers.Conv2D(channels, 1, padding='same')
+        self.softmax = layers.Softmax(axis=-1)
+        super().build(input_shape)
+
+    def call(self, inputs):
+        batch_size = tf.shape(inputs)[0]
+        height = tf.shape(inputs)[1]
+        width = tf.shape(inputs)[2]
+        channels = tf.shape(inputs)[3]
+
+        query = self.query_conv(inputs)
+        key = self.key_conv(inputs)
+        value = self.value_conv(inputs)
+
+        query = tf.reshape(query, [batch_size, -1, channels])
+        key = tf.reshape(key, [batch_size, -1, channels])
+        value = tf.reshape(value, [batch_size, -1, channels])
+
+        attention_scores = tf.matmul(query, key, transpose_b=True)
+        attention_scores = attention_scores / tf.sqrt(
+            tf.cast(channels, tf.float32)
+        )
+
+        attention_weights = self.softmax(attention_scores)
+        attention_output = tf.matmul(attention_weights, value)
+
+        attention_output = tf.reshape(
+            attention_output, [batch_size, height, width, channels]
+        )
+
+        return inputs + attention_output
+
+
+def create_xception_model():
+
+    base_model = Xception(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(*IMG_SIZE, 3),
+        pooling='avg'
+    )
+    base_model.trainable = False
+
+    inputs = layers.Input(shape=(*IMG_SIZE, 3))
+    x = base_model(inputs, training=False)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.45)(x)
+    outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
+
+    return models.Model(inputs, outputs,
+                        name='Xception_SENet_Attention')
+
+def create_integrated_model():
+
+    inputs = layers.Input(shape=(*IMG_SIZE, 3))
+
+    base_model = Xception(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(*IMG_SIZE, 3)
+    )
+    base_model.trainable = False
+
+    x = base_model(inputs, training=False)
+    x = layers.BatchNormalization()(x)
+
+    x = SENetBlock(reduction_ratio=16)(x)
+    x = AttentionBlock()(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.45)(x)
+    outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
+
+    return models.Model(inputs, outputs,
+                    name='Xception_SENet_Attention')
+
+
+# ============================================================================
+# TRAINING FUNCTION
+# ============================================================================
+
+def compile_and_train(model, X_train, y_train, X_val, y_val):
+
+    model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+    loss='categorical_crossentropy',
+    metrics=[
+        'accuracy',
+        keras.metrics.Precision(name='precision'),
+        keras.metrics.Recall(name='recall'),
+        keras.metrics.AUC(name='auc')
+    ]
+)
+
+    history = model.fit(
+        train_datagen.flow(X_train, y_train,
+                           batch_size=BATCH_SIZE),
+        validation_data=val_datagen.flow(X_val, y_val,
+                                         batch_size=BATCH_SIZE),
+        epochs=EPOCHS,
+        callbacks=[ReduceLROnPlateau(patience=3)],
+        verbose=1
+    )
+
+    return history
+
+
+def plot_training(history, model_name):
+
+    plt.figure(figsize=(18, 10))
+
+    metrics = [
+        ('accuracy', 'Accuracy'),
+        ('loss', 'Loss'),
+        ('precision', 'Precision'),
+        ('recall', 'Recall'),
+        ('auc', 'AUC')
+    ]
+
+    for i, (metric, label) in enumerate(metrics):
+
+        plt.subplot(2, 3, i + 1)
+
+        plt.plot(history.history[metric],
+                 label='Training',
+                 linewidth=2)
+
+        plt.plot(history.history[f'val_{metric}'],
+                 label='Validation',
+                 linewidth=2)
+
+        # Mark best validation epoch
+        if metric == 'loss':
+            best_epoch = np.argmin(history.history[f'val_{metric}'])
+        else:
+            best_epoch = np.argmax(history.history[f'val_{metric}'])
+
+        plt.scatter(
+            best_epoch,
+            history.history[f'val_{metric}'][best_epoch],
+            s=120,
+            marker='*',
+            zorder=5
+        )
+
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel(label, fontsize=12)
+        plt.title(f'{label} Curve - {model_name}',
+                  fontsize=13,
+                  fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================================
+# EVALUATION FUNCTION
+# ============================================================================
+
+def evaluate_model(model, X_test, y_test, model_name):
+
+    preds = model.predict(X_test, verbose=0)
+    y_pred = np.argmax(preds, axis=1)
+    y_true = np.argmax(y_test, axis=1)
+
+    acc = np.mean(y_pred == y_true)
+
+    print(f"\n{model_name} Test Accuracy: {acc:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES))
+
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt='d',
+                xticklabels=CLASS_NAMES,
+                yticklabels=CLASS_NAMES,
+                cmap='Blues')
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title(f"Confusion Matrix - {model_name}")
+    plt.tight_layout()
+    plt.show()
+
+    return acc, preds
+
+
+
+def main():
+
+    X, y = load_dataset(BASE_PATH)
+
+    # 70:20:10 Split
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=0.1,
+        stratify=y, random_state=42
+    )
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.2222,
+        stratify=y_temp, random_state=42
+    )
+
+    y_train = to_categorical(y_train, NUM_CLASSES)
+    y_val = to_categorical(y_val, NUM_CLASSES)
+    y_test = to_categorical(y_test, NUM_CLASSES)
+
+    # Baseline
+    baseline = create_xception_model()
+    hist_base = compile_and_train(
+        baseline, X_train, y_train, X_val, y_val
+    )
+    plot_training(hist_base, "Baseline")
+
+    acc_base, probs_base = evaluate_model(
+        baseline, X_test, y_test, "Baseline"
+    )
+
+    # Integrated
+    integrated = create_integrated_model()
+    hist_int = compile_and_train(
+        integrated, X_train, y_train, X_val, y_val
+    )
+    plot_training(hist_int, "Integrated")
+
+    acc_int, probs_int = evaluate_model(
+        integrated, X_test, y_test, "Integrated"
+    )
+
+    print("Baseline Accuracy:", acc_base)
+    print("Integrated Accuracy:", acc_int)
+
+    # 5-Fold CV (training set only)
+    skf = StratifiedKFold(n_splits=5,
+                          shuffle=True,
+                          random_state=42)
+
+    cv_base, cv_int = [], []
+
+    y_train_labels = np.argmax(y_train, axis=1)
+
+    for train_idx, val_idx in skf.split(X_train,
+                                        y_train_labels):
+
+        model_b = create_xception_model()
+        model_b.compile(
+            optimizer=keras.optimizers.Adam(LEARNING_RATE),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        model_b.fit(X_train[train_idx],
+                    y_train[train_idx],
+                    epochs=EPOCHS,
+                    batch_size=BATCH_SIZE,
+                    verbose=0)
+
+        cv_base.append(
+            model_b.evaluate(X_train[val_idx],
+                             y_train[val_idx],
+                             verbose=0)[1]
+        )
+
+        model_i = create_integrated_model()
+        model_i.compile(
+            optimizer=keras.optimizers.Adam(LEARNING_RATE),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        model_i.fit(X_train[train_idx],
+                    y_train[train_idx],
+                    epochs=EPOCHS,
+                    batch_size=BATCH_SIZE,
+                    verbose=0)
+
+        cv_int.append(
+            model_i.evaluate(X_train[val_idx],
+                             y_train[val_idx],
+                             verbose=0)[1]
+        )
+
+    # Statistical tests
+    t_stat, t_p = ttest_rel(cv_int, cv_base)
+    w_stat, w_p = wilcoxon(cv_int, cv_base)
+
+    print("Paired t-test:", t_stat, t_p)
+    print("Wilcoxon test:", w_stat, w_p)
+
+    # Calibration
+    y_pred = np.argmax(probs_int, axis=1)
+    y_true = np.argmax(y_test, axis=1)
+    confidences = np.max(probs_int, axis=1)
+    correctness = (y_pred == y_true)
+
+    prob_true, prob_pred = calibration_curve(
+        correctness, confidences, n_bins=10
+    )
+
+    plt.figure(figsize=(6,6))
+    plt.plot(prob_pred, prob_true, marker='o')
+    plt.plot([0,1],[0,1],'--')
+    plt.xlabel("Confidence")
+    plt.ylabel("Accuracy")
+    plt.title("Reliability Diagram")
+    plt.tight_layout()
+    plt.show()
+
+    ece = np.mean(np.abs(prob_true - prob_pred))
+    print("Expected Calibration Error:", ece)
+
+    # ============================================================================
+    # ROBUSTNESS EVALUATION UNDER SMALL PERTURBATIONS
+    # ============================================================================
+
+    print("\n" + "="*80)
+    print("ROBUSTNESS ANALYSIS UNDER SMALL PERTURBATIONS")
+    print("="*80)
+
+    import cv2
+
+    # ---------------------------
+    # Perturbation Functions
+    # ---------------------------
+
+    def apply_gaussian_blur(images, kernel_size=5):
+        blurred = []
+        for img in images:
+            img_uint8 = (img * 255).astype(np.uint8)
+            blur = cv2.GaussianBlur(img_uint8, (kernel_size, kernel_size), 0)
+            blurred.append(blur / 255.0)
+        return np.array(blurred)
+
+
+    def apply_jpeg_compression(images, quality=30):
+        compressed = []
+        for img in images:
+            img_uint8 = (img * 255).astype(np.uint8)
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+            _, encimg = cv2.imencode('.jpg', img_uint8, encode_param)
+            decimg = cv2.imdecode(encimg, 1)
+            decimg = cv2.cvtColor(decimg, cv2.COLOR_BGR2RGB)
+            compressed.append(decimg / 255.0)
+        return np.array(compressed)
+
+
+    def apply_rain_noise(images, intensity=0.2):
+        rain_images = []
+        for img in images:
+            noise = np.random.normal(0, intensity, img.shape)
+            rain_img = np.clip(img + noise, 0, 1)
+            rain_images.append(rain_img)
+        return np.array(rain_images)
+
+
+    # ---------------------------
+    # Apply Perturbations
+    # ---------------------------
+
+    X_blur = apply_gaussian_blur(X_test)
+    X_jpeg = apply_jpeg_compression(X_test)
+    X_rain = apply_rain_noise(X_test)
+
+
+    # ---------------------------
+    # Evaluation Function
+    # ---------------------------
+
+    def evaluate_shift(model, X_shift, y_test, label):
+        preds = model.predict(X_shift, verbose=0)
+        y_pred = np.argmax(preds, axis=1)
+        y_true = np.argmax(y_test, axis=1)
+        acc = np.mean(y_pred == y_true)
+        print(f"{label} Accuracy: {acc:.4f}")
+        return acc
+
+
+    print("\n--- Baseline Model ---")
+    acc_blur_base = evaluate_shift(baseline, X_blur, y_test, "Blur")
+    acc_jpeg_base = evaluate_shift(baseline, X_jpeg, y_test, "JPEG")
+    acc_rain_base = evaluate_shift(baseline, X_rain, y_test, "Rain Noise")
+
+    print("\n--- Integrated Model ---")
+    acc_blur_int = evaluate_shift(integrated, X_blur, y_test, "Blur")
+    acc_jpeg_int = evaluate_shift(integrated, X_jpeg, y_test, "JPEG")
+    acc_rain_int = evaluate_shift(integrated, X_rain, y_test, "Rain Noise")
+
+
+    # ---------------------------
+    # Plot Robustness Comparison
+    # ---------------------------
+
+    labels = ['Clean', 'Blur', 'JPEG', 'Rain']
+
+    baseline_scores = [
+        acc_base,
+        acc_blur_base,
+        acc_jpeg_base,
+        acc_rain_base
+    ]
+
+    integrated_scores = [
+        acc_int,
+        acc_blur_int,
+        acc_jpeg_int,
+        acc_rain_int
+    ]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    plt.figure(figsize=(8,6))
+    plt.bar(x - width/2, baseline_scores, width, label='Baseline')
+    plt.bar(x + width/2, integrated_scores, width, label='Integrated')
+
+    plt.xticks(x, labels)
+    plt.xlabel("Perturbation Type")
+    plt.ylabel("Accuracy")
+    plt.title("Model Robustness Under Image Perturbations")
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    baseline.save('/kaggle/working/baseline.h5')
+    integrated.save('/kaggle/working/integrated.h5')
+
+    print("Training Complete")
+
+
+if __name__ == "__main__":
+    main()
