@@ -68,7 +68,10 @@ def load_dataset(base_path):
             # Normalize first
             img = img.astype('float32') / 255.0
 
-            # Apply CLAHE (as claimed in manuscript)
+            # Apply standard histogram equalization
+            img = apply_histogram_equalization(img)
+
+            # Apply CLAHE
             img = apply_clahe(img)
 
             images.append(img)
